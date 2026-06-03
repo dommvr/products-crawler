@@ -1,0 +1,10 @@
+# Products Crawler — input file
+# One company name or URL per line.
+# Lines starting with # are ignored.
+# Both formats work:
+#   jysk          ← name only (will search for website)
+#   jysk.pl       ← domain (will verify then use)
+#   https://jysk.pl  ← full URL (used directly)
+
+jysk.pl
+janpol.pl

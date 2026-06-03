@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────
+#  Products Crawler — configuration
+# ─────────────────────────────────────────────
+
+# ── Input ────────────────────────────────────
+input:
+  # Path to file with company names / URLs (one per line)
+  names_file: "names.txt"
+
+  # One-word or short hint used when searching for the company website.
+  # Helps disambiguate companies with common names.
+  # Example: "meble", "materace", "elektronika"
+  company_category_hint: "materace"
+
+# ── Product filtering ─────────────────────────
+products:
+  # Categories to extract (Polish OK — auto-translated to English internally).
+  # Only products matching these categories will be saved.
+  # Can be one value or a list.
+  categories:
+    - "materace"
+
+  # Treat each size variant of a product as a separate row
+  extract_size_variants: true
+
+# ── Crawling ──────────────────────────────────
+crawling:
+  # Max pages to visit per company website (0 = unlimited)
+  max_pages: 20
+
+  # Seconds to wait between page requests (be polite)
+  delay_between_requests: 2.0
+
+  # Follow links to subdomains (e.g. sklep.example.com when on example.com)
+  follow_subdomains: true
+
+  # How many times to retry a failed page load
+  max_retries: 3
+
+  # How many search results to try if first URL doesn't work
+  search_results_to_try: 3
+
+  # Run browser in background (true = headless, false = visible window for debugging)
+  headless: true
+
+  # Request timeout in seconds
+  page_timeout: 30
+
+# ── LLM ───────────────────────────────────────
+llm:
+  # OpenAI model to use
+  model: "gpt-4o-mini"
+
+  # Max tokens per extraction call
+  max_tokens: 4000
+
+  # Temperature (0 = deterministic, higher = more creative — keep low for extraction)
+  temperature: 0.1
+
+# ── Output ────────────────────────────────────
+output:
+  # Google Sheets document name (new sheet created each run by default)
+  spreadsheet_name: "products_data"
+
+  # "new"    → always create a new spreadsheet
+  # "append" → append to existing spreadsheet with this name
+  # "overwrite" → clear and rewrite existing spreadsheet
+  sheet_mode: "new"
+
+  # Name of the tab/worksheet inside the spreadsheet
+  sheet_tab: "Products"
+
+  # Column to sort results by before writing
+  # Options: company_name, product_name, category, confidence
+  sort_by: "company_name"
+
+  # Save a local CSV backup as well
+  save_csv_backup: false
+
+  # Folder for CSV backup (created automatically if needed)
+  csv_output_dir: "outputs"
+
+# ── Google Sheets auth ────────────────────────
+google:
+  # Path to your service account credentials JSON
+  credentials_file: "credentials.json"
+
+# ── Search API ────────────────────────────────
+search:
+  # Search provider: "serper" or "google"
+  provider: "serper"
+  # API key — set via env var SERPER_API_KEY (recommended) or paste here
+  api_key: ""
+
+# ── OpenAI ────────────────────────────────────
+openai:
+  # API key — set via env var OPENAI_API_KEY (recommended) or paste here
+  api_key: ""
+
+# ── Skip list ─────────────────────────────────
+skip:
+  # Domains to skip entirely — not company product pages
+  domains:
+    - wikipedia.org
+    - linkedin.com
+    - facebook.com
+    - instagram.com
+    - twitter.com
+    - x.com
+    - youtube.com
+    - tiktok.com
+    - pinterest.com
+    - allegro.pl
+    - olx.pl
+    - ceneo.pl
+    - nokaut.pl
+    - skapiec.pl
+    - pricespy.pl
+    - opineo.pl
+    - google.com
+    - google.pl
+    - bing.com
+    - yahoo.com
+    - reddit.com
+    - quora.com
+    - amazon.com
+    - amazon.pl
+    - ebay.com
