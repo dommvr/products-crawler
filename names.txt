@@ -6,5 +6,5 @@
 #   jysk.pl       ← domain (will verify then use)
 #   https://jysk.pl  ← full URL (used directly)
 
-jysk
+#jysk
 janpol

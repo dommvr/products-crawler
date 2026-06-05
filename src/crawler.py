@@ -65,6 +65,15 @@ PAGINATION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Resource types and hostnames to block at the network level (speeds up page loads)
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_HOSTNAMES = re.compile(
+    r"(google-analytics|googletagmanager|doubleclick|facebook\.net"
+    r"|hotjar|segment\.io|mixpanel|amplitude|clarity\.ms"
+    r"|cookielaw|cookiebot)",
+    re.IGNORECASE,
+)
+
 # CSS selectors for size/variant controls
 VARIANT_SELECTORS = [
     "select[name*='size']", "select[name*='Size']", "select[name*='variant']",
@@ -153,19 +162,28 @@ class Crawler:
                     lnorm = _strip_fragment(link)
                     if lnorm in visited or _is_download(link):
                         continue
+                    # Skip individual product detail pages when we already visited their
+                    # parent category listing — the listing already contained those products
+                    if _is_product_detail_url(link):
+                        parent = _parent_url(lnorm)
+                        if parent and _strip_fragment(parent) in visited:
+                            log.debug(f"  Skipping product detail (parent visited): {link}")
+                            continue
                     if _is_high_priority(link):
                         high_q.append(link)
                     elif not _is_low_priority(link):
                         low_q.append(link)
                     # Low priority links are just discarded — saves pages for real content
 
-                # ── Check if this page has target products ────────────
-                has_products = await self.extractor.is_product_page(text, url)
+                # ── Extract products (always — no pre-check LLM call) ─
+                products = await self.extractor.extract_products(
+                    text, html, url, company_name
+                )
 
-                if not has_products:
+                if not products:
                     consecutive_irrelevant += 1
                     log.debug(
-                        f"  No target products [{consecutive_irrelevant}/{self.cfg.irrelevant_page_stop_threshold} irrelevant]"
+                        f"  No products extracted [{consecutive_irrelevant}/{self.cfg.irrelevant_page_stop_threshold} consecutive]"
                     )
                     # Early stop only once high priority queue is exhausted
                     if (
@@ -173,38 +191,24 @@ class Crawler:
                         and consecutive_irrelevant >= self.cfg.irrelevant_page_stop_threshold
                     ):
                         log.info(
-                            f"  {self.cfg.irrelevant_page_stop_threshold} consecutive irrelevant pages "
-                            f"with no high-priority URLs left — stopping crawl."
+                            f"  {self.cfg.irrelevant_page_stop_threshold} consecutive pages with no products "
+                            f"and no high-priority URLs left — stopping crawl."
                         )
                         break
-                    if self.cfg.delay > 0:
-                        await asyncio.sleep(self.cfg.delay)
-                    continue
-
-                # Reset irrelevant counter when we find products
-                consecutive_irrelevant = 0
-
-                # ── Extract products ──────────────────────────────────
-                products = await self.extractor.extract_products(
-                    text, html, url, company_name
-                )
-
-                # ── Click size/variant selectors ──────────────────────
-                if self.cfg.extract_size_variants and products:
-                    variant_products = await self._extract_variants(
-                        context, url, company_name
-                    )
-                    existing_names = {p.product_name for p in products}
-                    for vp in variant_products:
-                        if vp.product_name not in existing_names:
-                            products.append(vp)
-                            existing_names.add(vp.product_name)
-
-                if products:
+                else:
+                    consecutive_irrelevant = 0
+                    # ── Click size/variant selectors ──────────────────
+                    if self.cfg.extract_size_variants:
+                        variant_products = await self._extract_variants(
+                            context, url, company_name
+                        )
+                        existing_names = {p.product_name for p in products}
+                        for vp in variant_products:
+                            if vp.product_name not in existing_names:
+                                products.append(vp)
+                                existing_names.add(vp.product_name)
                     log.info(f"  ✓ Found {len(products)} product(s)")
                     all_products.extend(products)
-                else:
-                    log.debug(f"  LLM found no matching products")
 
                 if self.cfg.delay > 0:
                     await asyncio.sleep(self.cfg.delay)
@@ -225,17 +229,24 @@ class Crawler:
 
     async def _load_page(self, context: BrowserContext, url: str) -> tuple[str, str]:
         """Load page, return (html, text). Returns ('','') on failure. No retries for downloads."""
+
+        async def _handle_route(route) -> None:
+            req = route.request
+            if (
+                req.resource_type in BLOCKED_RESOURCE_TYPES
+                or bool(BLOCKED_HOSTNAMES.search(req.url))
+                or _is_download(req.url)
+            ):
+                await route.abort()
+            else:
+                await route.continue_()
+
         for attempt in range(1, self.cfg.max_retries + 1):
             page: Page | None = None
             try:
                 page = await context.new_page()
-                # Abort download attempts immediately
-                await page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if _is_download(route.request.url)
-                    else route.continue_(),
-                )
+                # Block images, fonts, CSS, media, and tracking scripts for speed
+                await page.route("**/*", _handle_route)
                 await page.goto(
                     url, wait_until="domcontentloaded", timeout=self.cfg.page_timeout
                 )
@@ -352,6 +363,24 @@ def _is_low_priority(url: str) -> bool:
     """True if URL is likely a non-product utility page."""
     path = urlparse(url).path
     return bool(LOW_PRIORITY_PATTERNS.search(path))
+
+
+def _is_product_detail_url(url: str) -> bool:
+    """True if URL looks like an individual product page rather than a category listing.
+
+    Heuristic: a last path segment that is long (>20 chars) with 3+ dashes is
+    almost always a specific product slug, e.g.:
+        /materace-piankowe/materac-piankowy-80x200cm-hulda-twardy
+    Pagination URLs are excluded so /page/2 is never treated as a detail page.
+    """
+    if PAGINATION_PATTERNS.search(url):
+        return False
+    path = urlparse(url).path.rstrip("/")
+    segments = [s for s in path.split("/") if s]
+    if len(segments) < 2:
+        return False
+    last = segments[-1]
+    return len(last) > 20 and last.count("-") >= 3
 
 
 def _extract_links(

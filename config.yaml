@@ -29,7 +29,7 @@ crawling:
   max_pages: 20
 
   # Seconds to wait between page requests (be polite)
-  delay_between_requests: 2.0
+  delay_between_requests: 0.5
 
   # Follow links to subdomains (e.g. sklep.example.com when on example.com)
   follow_subdomains: true
