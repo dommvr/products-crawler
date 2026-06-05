@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
+
+# Load .env from project root (no-op if file doesn't exist; never overwrites existing env vars)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def _deep_get(d: dict, *keys: str, default: Any = None) -> Any:
@@ -44,6 +48,9 @@ class Config:
         self.extract_size_variants: bool = _deep_get(raw, "products", "extract_size_variants", default=True)
 
         # ── Crawling ───────────────────────────────────────────────
+        self.irrelevant_page_stop_threshold: int = _deep_get(
+            raw, "crawling", "irrelevant_page_stop_threshold", default=5
+        )
         self.max_pages: int = _deep_get(raw, "crawling", "max_pages", default=20)
         self.delay: float = float(_deep_get(raw, "crawling", "delay_between_requests", default=2.0))
         self.follow_subdomains: bool = _deep_get(raw, "crawling", "follow_subdomains", default=True)

@@ -37,6 +37,10 @@ crawling:
   # How many times to retry a failed page load
   max_retries: 3
 
+  # Stop crawling a site after this many consecutive pages with no matching products
+  # (only triggers once the high-priority product URL queue is exhausted)
+  irrelevant_page_stop_threshold: 5
+
   # How many search results to try if first URL doesn't work
   search_results_to_try: 3
 
@@ -65,7 +69,7 @@ output:
   # "new"    → always create a new spreadsheet
   # "append" → append to existing spreadsheet with this name
   # "overwrite" → clear and rewrite existing spreadsheet
-  sheet_mode: "new"
+  sheet_mode: "overwrite"
 
   # Name of the tab/worksheet inside the spreadsheet
   sheet_tab: "Products"
@@ -75,7 +79,7 @@ output:
   sort_by: "company_name"
 
   # Save a local CSV backup as well
-  save_csv_backup: false
+  save_csv_backup: true
 
   # Folder for CSV backup (created automatically if needed)
   csv_output_dir: "outputs"
