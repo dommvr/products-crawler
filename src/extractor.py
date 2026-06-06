@@ -131,9 +131,17 @@ class Extractor:
         html: str,
         url: str,
         company_name: str,
+        skip_fiber: bool = False,
     ) -> list[Product]:
         """
         Extract product records from page content.
+
+        Args:
+            skip_fiber: When True (main crawl / category pages), fiber detection is
+                        skipped entirely.  Fiber info is only reliable when reading a
+                        dedicated product detail page, so the main crawl passes True
+                        and the fiber-detection pass passes False (default).
+
         Returns a (possibly empty) list of Product objects.
         """
         en_cats = await self.translate_categories()
@@ -146,6 +154,64 @@ class Extractor:
             "Return ONLY valid JSON, no markdown, no explanation."
         )
 
+        # ── Fiber detection section of the prompt ─────────────────────────────
+        if skip_fiber:
+            # Category / listing pages: never determine fiber — only detail pages are reliable
+            fiber_prompt_section = """\
+- has_natural_fiber: Always return empty string "".
+  (Fiber detection is only performed on dedicated product detail pages, not here.)
+- fiber_confidence: Always return 0.0
+- fiber_evidence: Always return ""\
+"""
+        else:
+            # Dedicated product detail page: apply strict fiber detection rules
+            fiber_prompt_section = """\
+- has_natural_fiber: Determine whether THIS specific product was manufactured using one of
+  EXACTLY these two materials as a structural layer of the mattress:
+
+    QUALIFYING MATERIALS — the ONLY ones that trigger "yes":
+      • włókno kokosowe — also written as: kokos, włókno z łupiny kokosowej, płyta kokosowa,
+        mata kokosowa, warstwa kokosowa, coconut fibre, coconut fiber, coir
+      • sizal / sisal — also written as: włókno sizalowe, sisal fiber
+
+    NON-QUALIFYING materials — return "" even when the word "naturalny/naturalne" appears nearby:
+      • lateks / latex (naturalny lateks, latex Pulse, lateks Pulse, kauczuk, rubber,
+        mleko kauczukowe, naturalne mleko kauczukowe, mleczko kauczukowe — ALL of these
+        are natural rubber, NOT coconut fiber or sisal)
+      • pianka HR / pianka wysokoelastyczna / HR foam
+      • pianka visco / memory foam / pianka termoelastyczna / viscoelastic
+      • pianka Energy Foam, pianka hybrydowa
+      • sprężyny, sprężyny kieszeniowe, bonell, kieszenie
+      • poliester, bawełna, lyocell, tencel, tkanina, włókno poliestrowe
+
+  Decision rules:
+    "yes" — the product's OWN composition/construction/specification section explicitly
+            mentions włókno kokosowe, kokos, sizal, or sisal as a material IN THIS product.
+    "no"  — the composition/construction section lists this product's materials and NONE
+            of the qualifying materials appear.
+    ""    — any of the following:
+              • No composition or material information is present for this specific product.
+              • The qualifying terms appear only in: general category descriptions,
+                FAQ text, navigation menus, filter labels, comparison tables, other
+                products' descriptions, or sentences like "some models contain coconut"
+                (not specific to THIS product).
+              • The page is a product listing / category page (not a single product page).
+
+  CRITICAL — common mistakes to avoid:
+    ✗ "naturalny lateks" → return "" (latex is rubber, not coconut fiber or sisal)
+    ✗ "naturalne mleko kauczukowe" → return "" (rubber tree milk ≠ coconut fiber)
+    ✗ "niektóre modele zawierają kokos" → return "" (general statement, not this product)
+    ✗ keyword appears in a different product's description → return ""
+
+- fiber_confidence: float 0.0–1.0 reflecting certainty of has_natural_fiber.
+  Use 0.9–1.0 when the exact qualifying term appears in a product composition/spec section.
+  Use 0.5–0.7 when inferring from a construction description without the exact wording.
+  Use 0.0 when has_natural_fiber is "".
+- fiber_evidence: Copy the VERBATIM text fragment (≤ 120 characters) from the page that
+  most directly supports your has_natural_fiber decision — ideally the material list or
+  specification sentence.  Use "" when has_natural_fiber is "".\
+"""
+
         user_prompt = f"""Extract products from this webpage that belong to these categories: {cats_str}
 
 IMPORTANT RULES:
@@ -155,26 +221,7 @@ IMPORTANT RULES:
   return a single entry with product_name = "Materac HULDA" (no dimensions in the name).
 - photo_url: extract the direct image URL if visible in the HTML. Use empty string if not found.
 - confidence: float 0.0–1.0 reflecting how certain you are this is a real product from the target category.
-- has_natural_fiber: Determine whether THIS specific product was MANUFACTURED/CONSTRUCTED
-  using coconut fiber (włókno kokosowe) or sisal (sizal) as a structural component of the mattress.
-  Look ONLY at material composition sections, construction layer descriptions, or specification
-  tables that describe what THIS product is made of.
-  Rules:
-    "yes"  — a composition/construction section explicitly states this product contains
-             włókno kokosowe / kokos / sizal / sisal / coconut fiber / coconut fibre.
-    "no"   — a composition/construction section lists the product's materials and none of
-             the above appear.
-    ""     — no material composition information is present on the page, OR the terms appear
-             only in general FAQ text, comparison tables, other products' descriptions,
-             or filter/navigation labels (not describing THIS product's construction).
-  DO NOT set "yes" just because the keyword appears anywhere on the page.
-- fiber_confidence: float 0.0–1.0 reflecting certainty of has_natural_fiber.
-  Use 0.9–1.0 when the exact material term appears in a product composition/spec section.
-  Use 0.5–0.7 when you are inferring from a construction description without exact wording.
-  Use 0.0 when has_natural_fiber is "".
-- fiber_evidence: Copy the VERBATIM text fragment (≤ 120 characters) from the page that most
-  directly supports your has_natural_fiber decision — ideally the material list or spec sentence.
-  Use empty string "" when has_natural_fiber is "".
+{fiber_prompt_section}
 - If no matching products found, return {{"products": []}}
 
 Return this exact JSON structure:
@@ -218,8 +265,16 @@ RELEVANT HTML SNIPPET (for image URLs):
             for item in data.get("products", []):
                 if not isinstance(item, dict):
                     continue
-                fiber_raw = str(item.get("has_natural_fiber", "")).strip().lower()
-                fiber_val = fiber_raw if fiber_raw in ("yes", "no") else ""
+                if skip_fiber:
+                    # Ignore whatever the LLM returned for fiber fields — force empty
+                    fiber_val = ""
+                    fiber_conf = 0.0
+                    fiber_evid = ""
+                else:
+                    fiber_raw = str(item.get("has_natural_fiber", "")).strip().lower()
+                    fiber_val = fiber_raw if fiber_raw in ("yes", "no") else ""
+                    fiber_conf = float(item.get("fiber_confidence", 0.0))
+                    fiber_evid = str(item.get("fiber_evidence", "")).strip()
                 products.append(Product(
                     company_name=company_name,
                     category=item.get("category", self.cfg.categories[0]),
@@ -228,8 +283,8 @@ RELEVANT HTML SNIPPET (for image URLs):
                     photo_url=item.get("photo_url", "").strip(),
                     confidence=float(item.get("confidence", 0.5)),
                     has_natural_fiber=fiber_val,
-                    fiber_confidence=float(item.get("fiber_confidence", 0.0)),
-                    fiber_evidence=str(item.get("fiber_evidence", "")).strip(),
+                    fiber_confidence=fiber_conf,
+                    fiber_evidence=fiber_evid,
                 ))
             return products
         except json.JSONDecodeError as e:

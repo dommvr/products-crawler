@@ -196,8 +196,11 @@ class Crawler:
                     # Low priority links are just discarded — saves pages for real content
 
                 # ── Extract products (always — no pre-check LLM call) ─
+                # skip_fiber=True: category/listing pages are not reliable for fiber info.
+                # Fiber detection only happens in the dedicated fiber pass below,
+                # where we visit a single product detail page per product.
                 products = await self.extractor.extract_products(
-                    text, html, url, company_name
+                    text, html, url, company_name, skip_fiber=True
                 )
 
                 if not products:
@@ -472,20 +475,51 @@ def _base_product_slug(url: str) -> str:
     return f"{parent}/{base}" if parent else base
 
 
+# Known type-descriptor words that can follow "Materac" in a product name.
+# These are stripped AFTER the "Materac/Topmaterac" prefix so that e.g.
+# "Materac piankowy HULDA" → "HULDA" (same key as "Materac HULDA").
+# Only explicitly listed words are removed — arbitrary brand words (WELLPUR, etc.) are kept.
+_TYPE_DESCRIPTOR_RE = re.compile(
+    r"^\s*(?:piankow[yi]|sprezynow[yi]|sprężynow[yi]|rehabilitacyjn[yi]"
+    r"|kieszeniow[yi]|lateksow[yi]|skladan[yi]|szpitaln[yi]|hybrydow[yi]"
+    r"|wielostrefow[yi]|nawierzchniow[yi]|poslaniow[yi]|posłaniow[yi]"
+    r"|dziecięc[yi]|niemowlęc[yi]|termoelastyczn[yi])\s+",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
 def _normalize_product_name(name: str) -> str:
     """Strip size patterns and product-type prefixes, then lowercase, for deduplication.
 
-    Strips leading "Materac [optional type word(s)] " and "Topmaterac " so that
-    e.g. "MARREN", "Topmaterac MARREN", "Materac piankowy MARREN" all map to "marren".
+    Uses a two-step approach to avoid incorrectly stripping brand words:
+      Step 1 — strip the bare "Materac " / "Topmaterac " prefix only.
+               OLD bug: the previous regex matched 0–2 words after the prefix with
+               re.IGNORECASE, which also matched uppercase brand names like "WELLPUR",
+               causing "Materac WELLPUR GLOMMA" → "glomma" but "WELLPUR GLOMMA" →
+               "wellpur glomma" (different keys → both survived dedup).
+      Step 2 — strip a single known type-descriptor word (piankowy, sprężynowy, …)
+               so "Materac piankowy HULDA" and "Materac HULDA" collapse to "hulda".
+
+    Examples:
+      "MARREN"                  → "marren"
+      "Topmaterac MARREN"       → "marren"
+      "Materac HULDA"           → "hulda"
+      "Materac piankowy HULDA"  → "hulda"
+      "WELLPUR GULEN"           → "wellpur gulen"
+      "Topmaterac WELLPUR GULEN"→ "wellpur gulen"   (WELLPUR kept — not a type word)
+      "WELLPUR GLOMMA"          → "wellpur glomma"
+      "Materac WELLPUR GLOMMA"  → "wellpur glomma"  (matches previous)
     """
     normalized = _SIZE_RE.sub("", name)
-    # Strip product-type prefix: "Materac [0–2 lowercase type words] " or "Topmaterac "
+    # Step 1: strip leading "Materac " or "Topmaterac " — just the prefix word, nothing else
     normalized = re.sub(
-        r"^\s*(?:topmaterac|materac)(?:\s+[a-zà-ſ]{2,20}){0,2}\s+",
+        r"^\s*(?:topmaterac|materac)\s+",
         "",
         normalized,
         flags=re.IGNORECASE | re.UNICODE,
     )
+    # Step 2: strip one optional known type-descriptor word (piankowy, sprężynowy, etc.)
+    normalized = _TYPE_DESCRIPTOR_RE.sub("", normalized)
     return re.sub(r"\s+", " ", normalized).strip().lower()
 
 
