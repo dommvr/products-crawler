@@ -39,23 +39,36 @@ SKIP_EXTENSIONS = re.compile(
     re.IGNORECASE,
 )
 
-# URL patterns that strongly suggest product listings or category pages (HIGH priority)
+# URL patterns that strongly suggest product listings or category pages (HIGH priority).
+# Intentionally limited to mattress-specific terms + generic shop/product/category words.
+# Bedroom furniture (beds, pillows, duvets) is excluded so we don't waste page budget on it.
 HIGH_PRIORITY_PATTERNS = re.compile(
     r"/(kategori|category|kolekcj|collection|produkt|product|sklep|shop"
-    r"|materac|mattress|piank|sprezy|spręż|topper|topmat"
-    r"|lozko|łóżko|bed|sofa|fotel|kanapa|furniture"
-    r"|sypialnia|bedroom)",
+    r"|materac|mattress|piank|sprezy|spręż|topper|topmat)",
     re.IGNORECASE,
 )
 
-# URL patterns that strongly suggest NON-product pages (LOW priority / skip)
+# URL patterns that strongly suggest NON-product pages (LOW priority / skip).
+# Includes common bedroom non-mattress sections to avoid crawling beds, pillows, duvets, sheets.
 LOW_PRIORITY_PATTERNS = re.compile(
     r"/(login|logowanie|konto|account|basket|koszyk|checkout|platnosc|payment"
     r"|customer|register|rejestracja|newsletter|gazetki|wyprzedaz(?!/.*materac)"
-    r"|inspiration|znajdz-sklep|find-store|careers|kariera|b2b"
+    r"|znajdz-sklep|find-store|careers|kariera|b2b"
     r"|customer-service|kontakt|contact|about|o-nas|regulamin|privacy"
-    r"|faq|blog|news|aktualnosci|press|media|sitemap|vr-|do-pobrania"
-    r"|wp-content|wp-admin|feed|rss|projekt-unijny)",
+    r"|faq|news|aktualnosci|press|media|sitemap|vr-|do-pobrania"
+    r"|wp-content|wp-admin|feed|rss|projekt-unijny"
+    r"|lozka|lozko|lozek|ramy-lozek|stelaz|zaglowek|nogi-do-lozek|akcesoria-do-lozek"
+    r"|lozka-goscinne|lozka-dzieciece|lozka-kontynentalne|lozka-pietrowe"
+    r"|koldry|koldra|poduszki|poduszka|posciel|przescieradl|ochraniacze"
+    r"|fotel|sofa|kanapa|sypialnia(?!/.*materac)"
+    r"|ogrod|garden|kemping|dmuchane"
+    r"|wyrejestrowac|zmienic-moj-adres|porady|aktualnosci|inspiration|guide|blog)",
+    re.IGNORECASE,
+)
+
+# URL path must contain one of these for a product to be relevant to the mattress fiber pass
+MATTRESS_PATH_RE = re.compile(
+    r"/(materac|mattress|piank|sprezy|spręż|topper|topmat)",
     re.IGNORECASE,
 )
 
@@ -116,6 +129,10 @@ class Crawler:
 
         pages_visited = 0
         consecutive_irrelevant = 0
+        # Maps base_slug → first detail URL seen for that product.
+        # Detail pages are NOT added to the main crawl queue — they are visited
+        # in a separate fiber detection pass after the main crawl finishes.
+        pending_fiber_urls: dict[str, str] = {}
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=self.cfg.headless)
@@ -162,13 +179,16 @@ class Crawler:
                     lnorm = _strip_fragment(link)
                     if lnorm in visited or _is_download(link):
                         continue
-                    # Skip individual product detail pages when we already visited their
-                    # parent category listing — the listing already contained those products
+                    # Product detail pages are NOT added to the main crawl queue.
+                    # We record the first URL per base slug (only for mattress-relevant
+                    # paths) and visit them all in the dedicated fiber detection pass.
                     if _is_product_detail_url(link):
-                        parent = _parent_url(lnorm)
-                        if parent and _strip_fragment(parent) in visited:
-                            log.debug(f"  Skipping product detail (parent visited): {link}")
-                            continue
+                        if MATTRESS_PATH_RE.search(urlparse(lnorm).path):
+                            base = _base_product_slug(lnorm)
+                            if base not in pending_fiber_urls:
+                                pending_fiber_urls[base] = lnorm
+                                log.debug(f"  Queued for fiber pass: {lnorm}")
+                        continue  # keep out of main queue regardless of path
                     if _is_high_priority(link):
                         high_q.append(link)
                     elif not _is_low_priority(link):
@@ -213,16 +233,50 @@ class Crawler:
                 if self.cfg.delay > 0:
                     await asyncio.sleep(self.cfg.delay)
 
+            # ── Fiber detection pass ─────────────────────────────────
+            # Visit one detail page per unique product to extract full material
+            # descriptions. This pass runs after the main crawl and is not
+            # subject to the max_pages limit — every product gets checked.
+            if pending_fiber_urls:
+                log.info(
+                    f"  Fiber pass: checking {len(pending_fiber_urls)} product page(s) "
+                    f"for coconut fiber / sisal..."
+                )
+                for fiber_idx, (base_slug, detail_url) in enumerate(pending_fiber_urls.items(), 1):
+                    log.info(f"  [Fiber {fiber_idx}/{len(pending_fiber_urls)}] {detail_url}")
+                    fhtml, ftext = await self._load_page(context, detail_url)
+                    if not fhtml:
+                        continue
+                    fproducts = await self.extractor.extract_products(
+                        ftext, fhtml, detail_url, company_name
+                    )
+                    if fproducts:
+                        fiber_summary = [
+                            f"{p.product_name}: {p.has_natural_fiber or '?'}"
+                            for p in fproducts
+                        ]
+                        log.info(f"    → {', '.join(fiber_summary)}")
+                        all_products.extend(fproducts)
+                    if self.cfg.delay > 0:
+                        await asyncio.sleep(self.cfg.delay)
+
             await browser.close()
 
-        # Deduplicate by (product_name, url)
-        seen: set[tuple[str, str]] = set()
-        deduped: list[Product] = []
+        # Deduplicate by normalized product name (size + type-prefix stripped, lowercased).
+        # Priority: records with actual fiber determination ("yes"/"no") beat unknown ("").
+        # Among records with the same fiber-determined status, higher fiber_confidence wins.
+        def _fiber_key(p: Product) -> tuple:
+            has_info = 1 if p.has_natural_fiber in ("yes", "no") else 0
+            return (has_info, p.fiber_confidence)
+
+        seen_names: dict[str, Product] = {}
         for p in all_products:
-            key = (p.product_name.lower().strip(), p.url)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(p)
+            key = _normalize_product_name(p.product_name)
+            if not key:
+                continue
+            if key not in seen_names or _fiber_key(p) > _fiber_key(seen_names[key]):
+                seen_names[key] = p
+        deduped = list(seen_names.values())
 
         log.info(f"  Total unique products for {company_name}: {len(deduped)}")
         return deduped
@@ -368,10 +422,13 @@ def _is_low_priority(url: str) -> bool:
 def _is_product_detail_url(url: str) -> bool:
     """True if URL looks like an individual product page rather than a category listing.
 
-    Heuristic: a last path segment that is long (>20 chars) with 3+ dashes is
-    almost always a specific product slug, e.g.:
-        /materace-piankowe/materac-piankowy-80x200cm-hulda-twardy
-    Pagination URLs are excluded so /page/2 is never treated as a detail page.
+    Two detection methods:
+    1. /produkty/slug or /products/slug path pattern (janpol-style short slugs)
+    2. Long last segment (>20 chars, ≥2 dashes) — jysk-style e.g.
+       /materace-piankowe/materac-piankowy-80x200cm-hulda-twardy
+       /topmaterace/topmaterac-80x200cm-marren  (only 2 dashes!)
+
+    Pagination URLs are always excluded.
     """
     if PAGINATION_PATTERNS.search(url):
         return False
@@ -379,8 +436,57 @@ def _is_product_detail_url(url: str) -> bool:
     segments = [s for s in path.split("/") if s]
     if len(segments) < 2:
         return False
+    # Method 1: explicit product-namespace segment
+    if segments[-2].lower() in ("produkty", "products", "product", "produkt", "produkts"):
+        return True
+    # Method 2: long, dash-rich slug
     last = segments[-1]
-    return len(last) > 20 and last.count("-") >= 3
+    return len(last) > 20 and last.count("-") >= 2
+
+
+# Matches dimension patterns inside product name / URL slug
+_SIZE_RE = re.compile(
+    r"\b\d{2,3}\s*[xX×]\s*\d{2,3}\s*(?:cm)?\b"   # 80x200, 80x200cm
+    r"|\b\d{2,3}\s*cm\b",                           # 180cm
+    re.IGNORECASE,
+)
+
+
+def _base_product_slug(url: str) -> str:
+    """Return a size-agnostic key for a product detail URL.
+
+    Strips dimension patterns from the last path segment so that different
+    size variants of the same product collapse to the same key, e.g.:
+        /materace/materac-hulda-80x200cm-twardy
+        /materace/materac-hulda-160x200cm-twardy
+    Both return: "materace/materac-hulda-twardy"
+    """
+    path = urlparse(url).path.rstrip("/")
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return url
+    last = segments[-1]
+    base = _SIZE_RE.sub("", last)
+    base = re.sub(r"-{2,}", "-", base).strip("-")
+    parent = "/".join(segments[:-1])
+    return f"{parent}/{base}" if parent else base
+
+
+def _normalize_product_name(name: str) -> str:
+    """Strip size patterns and product-type prefixes, then lowercase, for deduplication.
+
+    Strips leading "Materac [optional type word(s)] " and "Topmaterac " so that
+    e.g. "MARREN", "Topmaterac MARREN", "Materac piankowy MARREN" all map to "marren".
+    """
+    normalized = _SIZE_RE.sub("", name)
+    # Strip product-type prefix: "Materac [0–2 lowercase type words] " or "Topmaterac "
+    normalized = re.sub(
+        r"^\s*(?:topmaterac|materac)(?:\s+[a-zà-ſ]{2,20}){0,2}\s+",
+        "",
+        normalized,
+        flags=re.IGNORECASE | re.UNICODE,
+    )
+    return re.sub(r"\s+", " ", normalized).strip().lower()
 
 
 def _extract_links(

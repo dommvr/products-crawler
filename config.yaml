@@ -21,7 +21,7 @@ products:
     - "materace"
 
   # Treat each size variant of a product as a separate row
-  extract_size_variants: true
+  extract_size_variants: false
 
 # ── Crawling ──────────────────────────────────
 crawling:
@@ -56,7 +56,7 @@ llm:
   model: "gpt-4o-mini"
 
   # Max tokens per extraction call
-  max_tokens: 4000
+  max_tokens: 6000
 
   # Temperature (0 = deterministic, higher = more creative — keep low for extraction)
   temperature: 0.1
