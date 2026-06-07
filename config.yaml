@@ -50,6 +50,15 @@ crawling:
   # Request timeout in seconds
   page_timeout: 30
 
+  # How many product detail pages to load/extract at once during the fiber pass.
+  # The fiber pass is the slowest phase; higher = faster (near-linear) but more load
+  # on the site and OpenAI. 6 is a safe default; raise to ~10 if you have headroom.
+  fiber_pass_concurrency: 6
+
+  # Seconds to wait after the DOM loads, letting client-side JS render.
+  # Lower = faster. 0.8s is enough for jysk/janpol; raise if a site renders late.
+  render_wait: 0.8
+
 # ── LLM ───────────────────────────────────────
 llm:
   # OpenAI model to use

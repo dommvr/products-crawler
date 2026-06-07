@@ -58,6 +58,13 @@ class Config:
         self.search_results_to_try: int = _deep_get(raw, "crawling", "search_results_to_try", default=3)
         self.headless: bool = _deep_get(raw, "crawling", "headless", default=True)
         self.page_timeout: int = int(_deep_get(raw, "crawling", "page_timeout", default=30)) * 1000  # ms
+        # How many product detail pages to load/extract concurrently in the fiber pass.
+        # The fiber pass is the slowest phase; raising this speeds it up almost linearly.
+        # 6 is a good balance of speed vs. politeness / OpenAI rate limits.
+        self.fiber_concurrency: int = int(_deep_get(raw, "crawling", "fiber_pass_concurrency", default=6))
+        # Seconds to wait after a page's DOM loads, to let client-side JS render content.
+        # Lower = faster but risks missing late-rendered text. 0.8s works for these sites.
+        self.render_wait: float = float(_deep_get(raw, "crawling", "render_wait", default=0.8))
 
         # ── LLM ────────────────────────────────────────────────────
         self.llm_model: str = _deep_get(raw, "llm", "model", default="gpt-4o-mini")

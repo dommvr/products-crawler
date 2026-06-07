@@ -241,29 +241,42 @@ class Crawler:
             # descriptions. This pass runs after the main crawl and is not
             # subject to the max_pages limit — every product gets checked.
             if pending_fiber_urls:
+                total = len(pending_fiber_urls)
+                concurrency = max(1, self.cfg.fiber_concurrency)
                 log.info(
-                    f"  Fiber pass: checking {len(pending_fiber_urls)} product page(s) "
-                    f"for coconut fiber / sisal..."
+                    f"  Fiber pass: checking {total} product page(s) for coconut fiber / sisal "
+                    f"(concurrency={concurrency})..."
                 )
-                for fiber_idx, (base_slug, detail_url) in enumerate(pending_fiber_urls.items(), 1):
-                    log.info(f"  [Fiber {fiber_idx}/{len(pending_fiber_urls)}] {detail_url}")
-                    fhtml, ftext = await self._load_page(context, detail_url)
-                    if not fhtml:
-                        continue
+                sem = asyncio.Semaphore(concurrency)
+                progress = {"done": 0}
+
+                async def _check_fiber(detail_url: str) -> Product | None:
                     # single_product=True: a detail page is about ONE product. Tell the
                     # model to ignore related / "you may also like" carousels so we don't
                     # mis-attribute this page's composition to other products shown on it.
-                    fproducts = await self.extractor.extract_products(
-                        ftext, fhtml, detail_url, company_name, single_product=True
+                    async with sem:
+                        fhtml, ftext = await self._load_page(context, detail_url)
+                        if not fhtml:
+                            result = None
+                        else:
+                            fproducts = await self.extractor.extract_products(
+                                ftext, fhtml, detail_url, company_name, single_product=True
+                            )
+                            # Safety net against carousel leakage: keep only the single
+                            # product whose name matches this detail page's URL slug.
+                            result = _pick_primary_product(fproducts, detail_url) if fproducts else None
+                    progress["done"] += 1
+                    label = (
+                        f"{result.product_name}: {result.has_natural_fiber or '?'}"
+                        if result else "(no product extracted)"
                     )
-                    if fproducts:
-                        # Safety net against carousel leakage: keep only the single product
-                        # whose name matches this detail page's URL slug.
-                        primary = _pick_primary_product(fproducts, detail_url)
-                        log.info(f"    → {primary.product_name}: {primary.has_natural_fiber or '?'}")
-                        all_products.append(primary)
-                    if self.cfg.delay > 0:
-                        await asyncio.sleep(self.cfg.delay)
+                    log.info(f"  [Fiber {progress['done']}/{total}] {label}  ←  {detail_url}")
+                    return result
+
+                results = await asyncio.gather(
+                    *(_check_fiber(u) for u in pending_fiber_urls.values())
+                )
+                all_products.extend(r for r in results if r is not None)
 
             await browser.close()
 
@@ -315,7 +328,7 @@ class Crawler:
                 await page.goto(
                     url, wait_until="domcontentloaded", timeout=self.cfg.page_timeout
                 )
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(self.cfg.render_wait)
                 html = await page.content()
                 text = _html_to_text(html)
                 return html, text
@@ -462,23 +475,52 @@ _SIZE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A single hyphen-token that is purely a dimension, e.g. "80x200cm", "60x190x7cm", "200".
+_SIZE_TOKEN_RE = re.compile(r"^\d{1,3}(?:[xX×]\d{1,3})*(?:cm)?$", re.IGNORECASE)
+
+# Firmness / colour / variant descriptor tokens. These distinguish variants of the
+# SAME product (e.g. "twardy" vs "średni", "biały" vs "szary"), so they are dropped
+# from the slug key — we only need to visit ONE detail page per real product in the
+# fiber pass. The final name-based dedup would merge them anyway, so visiting every
+# firmness/colour separately is wasted time.
+_VARIANT_SLUG_TOKENS = frozenset({
+    # firmness
+    "twardy", "twarda", "twarde", "bardzo", "sredni", "srednia", "srednio",
+    "średni", "średnia", "średnio", "sredniotwardy", "miekki", "miękki",
+    "miekka", "miękka", "miekko", "miękko", "hard", "medium", "soft", "firm",
+    # colours
+    "bialy", "biała", "biala", "biały", "szary", "szara", "czarny", "czarna",
+    "grafit", "grafitowy", "bezowy", "bezowa", "bezowy", "beżowy", "beżowa",
+    "niebieski", "niebieska", "zielony", "zielona", "rozowy", "różowy",
+    "czerwony", "brazowy", "brązowy", "kremowy", "white", "grey", "gray", "black",
+})
+
 
 def _base_product_slug(url: str) -> str:
-    """Return a size-agnostic key for a product detail URL.
+    """Return a size-, firmness- and colour-agnostic key for a product detail URL.
 
-    Strips dimension patterns from the last path segment so that different
-    size variants of the same product collapse to the same key, e.g.:
-        /materace/materac-hulda-80x200cm-twardy
-        /materace/materac-hulda-160x200cm-twardy
-    Both return: "materace/materac-hulda-twardy"
+    Collapses variants of the same product to one key so the fiber pass visits each
+    product only once. Strips dimension tokens AND firmness/colour descriptor tokens
+    from the last path segment, e.g. all of these map to "materace-piankowe/materac-piankowy-svinna":
+        /materace-piankowe/materac-piankowy-80x200-svinna-twardy
+        /materace-piankowe/materac-piankowy-80x200-svinna-sredni
+        /materace-piankowe/materac-piankowy-80x200-svinna-bardzo-twardy
+    and these map to "topmaterace/topmaterac-wellpur-gulen":
+        /topmaterace/topmaterac-80x200cm-wellpur-gulen-szary
+        /topmaterace/topmaterac-80x200cm-wellpur-gulen-bialy
     """
     path = urlparse(url).path.rstrip("/")
     segments = [s for s in path.split("/") if s]
     if not segments:
         return url
-    last = segments[-1]
-    base = _SIZE_RE.sub("", last)
-    base = re.sub(r"-{2,}", "-", base).strip("-")
+    last = _SIZE_RE.sub("-", segments[-1])
+    tokens = [
+        t for t in last.split("-")
+        if t
+        and not _SIZE_TOKEN_RE.match(t)
+        and t.lower() not in _VARIANT_SLUG_TOKENS
+    ]
+    base = "-".join(tokens)
     parent = "/".join(segments[:-1])
     return f"{parent}/{base}" if parent else base
 
