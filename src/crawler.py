@@ -250,34 +250,42 @@ class Crawler:
                     fhtml, ftext = await self._load_page(context, detail_url)
                     if not fhtml:
                         continue
+                    # single_product=True: a detail page is about ONE product. Tell the
+                    # model to ignore related / "you may also like" carousels so we don't
+                    # mis-attribute this page's composition to other products shown on it.
                     fproducts = await self.extractor.extract_products(
-                        ftext, fhtml, detail_url, company_name
+                        ftext, fhtml, detail_url, company_name, single_product=True
                     )
                     if fproducts:
-                        fiber_summary = [
-                            f"{p.product_name}: {p.has_natural_fiber or '?'}"
-                            for p in fproducts
-                        ]
-                        log.info(f"    → {', '.join(fiber_summary)}")
-                        all_products.extend(fproducts)
+                        # Safety net against carousel leakage: keep only the single product
+                        # whose name matches this detail page's URL slug.
+                        primary = _pick_primary_product(fproducts, detail_url)
+                        log.info(f"    → {primary.product_name}: {primary.has_natural_fiber or '?'}")
+                        all_products.append(primary)
                     if self.cfg.delay > 0:
                         await asyncio.sleep(self.cfg.delay)
 
             await browser.close()
 
         # Deduplicate by normalized product name (size + type-prefix stripped, lowercased).
-        # Priority: records with actual fiber determination ("yes"/"no") beat unknown ("").
-        # Among records with the same fiber-determined status, higher fiber_confidence wins.
-        def _fiber_key(p: Product) -> tuple:
+        # When the same product appears from a category page AND its own detail page,
+        # the surviving record is chosen by this priority (highest wins):
+        #   1. came from a direct product DETAIL URL   (so the kept row links to /produkt…)
+        #   2. has an actual fiber determination "yes"/"no"  (beats undetermined "")
+        #   3. higher fiber_confidence
+        # Putting the detail-URL flag first guarantees a collapsed duplicate keeps the
+        # specific product link, never the general /kategoria-produktu/ listing link.
+        def _dedup_key(p: Product) -> tuple:
+            is_detail = 1 if _is_product_detail_url(p.url) else 0
             has_info = 1 if p.has_natural_fiber in ("yes", "no") else 0
-            return (has_info, p.fiber_confidence)
+            return (is_detail, has_info, p.fiber_confidence)
 
         seen_names: dict[str, Product] = {}
         for p in all_products:
             key = _normalize_product_name(p.product_name)
             if not key:
                 continue
-            if key not in seen_names or _fiber_key(p) > _fiber_key(seen_names[key]):
+            if key not in seen_names or _dedup_key(p) > _dedup_key(seen_names[key]):
                 seen_names[key] = p
         deduped = list(seen_names.values())
 
@@ -521,6 +529,42 @@ def _normalize_product_name(name: str) -> str:
     # Step 2: strip one optional known type-descriptor word (piankowy, sprężynowy, etc.)
     normalized = _TYPE_DESCRIPTOR_RE.sub("", normalized)
     return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+# Generic words that are NOT distinctive product identifiers — ignored when matching
+# a product name against a URL slug (they appear in almost every slug).
+_GENERIC_NAME_TOKENS = frozenset({
+    "materac", "topmaterac", "mattress", "piankowy", "piankowa", "sprezynowy",
+    "sprężynowy", "sprezynowa", "rehabilitacyjny", "kieszeniowy", "lateksowy",
+    "skladany", "składany", "szpitalny", "hybrydowy", "termoelastyczny",
+    "poslaniowy", "posłaniowy", "dzieciecy", "dziecięcy",
+})
+
+
+def _pick_primary_product(products: list[Product], detail_url: str) -> Product:
+    """From a detail page's extracted products, return the ONE that the page is about.
+
+    A product detail page can still leak "related / you may also like" products into
+    the extraction. The primary product is the one whose distinctive name token (brand
+    word like GULEN, BILLEFJORD, HULDA) appears in the page's URL slug, e.g.
+        url  .../topmaterace/topmaterac-80x200cm-wellpur-gulen-szary
+        name "Topmaterac WELLPUR GULEN"  → token "gulen" is in the slug → primary.
+
+    Falls back to the first product if nothing matches the slug.
+    """
+    if len(products) == 1:
+        return products[0]
+
+    slug = urlparse(detail_url).path.rstrip("/").split("/")[-1].lower()
+
+    for p in products:
+        tokens = re.findall(r"[a-zà-ſ]{3,}", p.product_name.lower())
+        for tok in tokens:
+            if tok in _GENERIC_NAME_TOKENS:
+                continue
+            if tok in slug:
+                return p
+    return products[0]
 
 
 def _extract_links(

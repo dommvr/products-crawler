@@ -132,6 +132,7 @@ class Extractor:
         url: str,
         company_name: str,
         skip_fiber: bool = False,
+        single_product: bool = False,
     ) -> list[Product]:
         """
         Extract product records from page content.
@@ -141,6 +142,11 @@ class Extractor:
                         skipped entirely.  Fiber info is only reliable when reading a
                         dedicated product detail page, so the main crawl passes True
                         and the fiber-detection pass passes False (default).
+            single_product: When True (fiber pass on a product DETAIL page), the page
+                        is about exactly ONE product.  The model is told to return only
+                        the primary product and ignore related / recommended / "you may
+                        also like" carousels — this prevents one detail page's material
+                        composition from being mis-attributed to other products shown on it.
 
         Returns a (possibly empty) list of Product objects.
         """
@@ -187,15 +193,20 @@ class Extractor:
   Decision rules:
     "yes" — the product's OWN composition/construction/specification section explicitly
             mentions włókno kokosowe, kokos, sizal, or sisal as a material IN THIS product.
-    "no"  — the composition/construction section lists this product's materials and NONE
-            of the qualifying materials appear.
-    ""    — any of the following:
-              • No composition or material information is present for this specific product.
-              • The qualifying terms appear only in: general category descriptions,
-                FAQ text, navigation menus, filter labels, comparison tables, other
-                products' descriptions, or sentences like "some models contain coconut"
-                (not specific to THIS product).
-              • The page is a product listing / category page (not a single product page).
+    "no"  — the page contains a description, composition, construction, or specification
+            of THIS product, and NONE of the qualifying materials (coconut fiber / sisal)
+            appear in it.  This is the DEFAULT whenever the product is described but coconut
+            fiber / sisal is not mentioned.  Choose "no" — do NOT hedge to "".
+    ""    — ONLY when the page contains essentially NO descriptive information about this
+            product at all: no composition, no construction details, no specification,
+            no material description — i.e. there is nothing to judge from.
+            Also use "" if the qualifying terms appear ONLY in unrelated context (general
+            category descriptions, FAQ text, navigation/filter labels, comparison tables,
+            OTHER products' descriptions, or "some models contain coconut" statements that
+            are not specific to THIS product) AND this product's own materials are not given.
+
+  IMPORTANT: Prefer "no" over "". If you can see what the product is made of (even partially)
+  and coconut fiber / sisal is not among the materials, the answer is "no", not "".
 
   CRITICAL — common mistakes to avoid:
     ✗ "naturalny lateks" → return "" (latex is rubber, not coconut fiber or sisal)
@@ -204,18 +215,33 @@ class Extractor:
     ✗ keyword appears in a different product's description → return ""
 
 - fiber_confidence: float 0.0–1.0 reflecting certainty of has_natural_fiber.
-  Use 0.9–1.0 when the exact qualifying term appears in a product composition/spec section.
-  Use 0.5–0.7 when inferring from a construction description without the exact wording.
-  Use 0.0 when has_natural_fiber is "".
+  Use 0.9–1.0 when the exact qualifying term appears ("yes"), OR when a clear composition
+  section is present and simply lacks coconut fiber / sisal ("no").
+  Use 0.5–0.7 when inferring from a partial construction description without exact wording.
+  Use 0.0 only when has_natural_fiber is "".
 - fiber_evidence: Copy the VERBATIM text fragment (≤ 120 characters) from the page that
   most directly supports your has_natural_fiber decision — ideally the material list or
   specification sentence.  Use "" when has_natural_fiber is "".\
 """
 
+        # Single-product preamble for the fiber pass (detail pages)
+        single_product_rule = ""
+        if single_product:
+            single_product_rule = (
+                "- THIS IS A SINGLE PRODUCT DETAIL PAGE. Extract ONLY the one primary product "
+                "that this page is about (the product shown in the page title / main H1 heading "
+                "and the main description/specification area).\n"
+                "  Do NOT extract related products, recommended products, 'you may also like', "
+                "'customers also viewed', 'podobne produkty', 'polecane', comparison items, or any "
+                "product shown in a carousel/grid of OTHER products. Return EXACTLY ONE product.\n"
+                "  The material composition you report MUST come from THIS product's own "
+                "description — never from another product listed on the page.\n"
+            )
+
         user_prompt = f"""Extract products from this webpage that belong to these categories: {cats_str}
 
 IMPORTANT RULES:
-- Only extract products from the specified categories. Ignore everything else.
+{single_product_rule}- Only extract products from the specified categories. Ignore everything else.
 - Return each UNIQUE PRODUCT NAME only ONCE — do NOT create separate entries for different sizes.
   Example: if you see "Materac HULDA 80x200", "Materac HULDA 90x200", "Materac HULDA 160x200",
   return a single entry with product_name = "Materac HULDA" (no dimensions in the name).
