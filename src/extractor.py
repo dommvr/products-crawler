@@ -10,17 +10,51 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (
+    AsyncOpenAI,
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    RateLimitError,
+)
 
 from src.config import Config
 
 logger = logging.getLogger("crawler")
+
+# Backoff tuning for OpenAI rate-limit (429) / transient errors. Exponential with jitter,
+# capped — but the server's Retry-After hint (when present) takes precedence.
+_RETRY_BASE_DELAY = 1.0   # seconds, first backoff step
+_RETRY_MAX_DELAY = 30.0   # seconds, per-attempt cap
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Extract the server's suggested wait from a 429 response, if it provided one.
+
+    OpenAI sets either `retry-after-ms` (milliseconds) or `retry-after` (seconds)."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None) or {}
+    ms = headers.get("retry-after-ms")
+    if ms is not None:
+        try:
+            return float(ms) / 1000.0
+        except (TypeError, ValueError):
+            pass
+    ra = headers.get("retry-after")
+    if ra is not None:
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 @dataclass
@@ -66,8 +100,51 @@ class Product:
 class Extractor:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.client = AsyncOpenAI(api_key=cfg.openai_api_key)
+        # max_retries=0: we do our own retry loop (_create_completion) so backoff is
+        # explicit and logged, and so we can honor the 429 Retry-After hint ourselves.
+        self.client = AsyncOpenAI(api_key=cfg.openai_api_key, max_retries=0)
         self._translated_categories: list[str] = []
+
+    async def _create_completion(self, **kwargs: Any):
+        """Call chat.completions.create with bounded retry + exponential backoff.
+
+        OpenAI returns HTTP 429 when we exceed the per-minute token (TPM) limit; under
+        concurrent crawling this happens in bursts. We retry on 429, timeouts, connection
+        errors, and transient 5xx — backing off (with jitter, honoring Retry-After) so an
+        extraction isn't silently dropped. Non-retryable client errors (e.g. bad request)
+        are raised immediately."""
+        attempts = max(1, self.cfg.llm_max_retries)
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self.client.chat.completions.create(**kwargs)
+            except RateLimitError as e:
+                last_exc = e
+                delay = _retry_after_seconds(e)
+                if delay is None:
+                    delay = min(_RETRY_BASE_DELAY * 2 ** (attempt - 1), _RETRY_MAX_DELAY)
+            except (APITimeoutError, APIConnectionError) as e:
+                last_exc = e
+                delay = min(_RETRY_BASE_DELAY * 2 ** (attempt - 1), _RETRY_MAX_DELAY)
+            except APIError as e:
+                # Retry transient server errors (5xx); re-raise other client errors.
+                status = getattr(e, "status_code", None)
+                if status is not None and 500 <= status < 600:
+                    last_exc = e
+                    delay = min(_RETRY_BASE_DELAY * 2 ** (attempt - 1), _RETRY_MAX_DELAY)
+                else:
+                    raise
+            if attempt >= attempts:
+                break
+            delay += random.uniform(0, _RETRY_BASE_DELAY)  # jitter to de-sync concurrent retries
+            logger.warning(
+                f"  OpenAI {type(last_exc).__name__} (attempt {attempt}/{attempts}) — "
+                f"retrying in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+        # Retries exhausted — surface the last error to the caller's handler.
+        assert last_exc is not None
+        raise last_exc
 
     async def translate_categories(self) -> list[str]:
         """Translate configured category names to English (cached after first call)."""
@@ -81,7 +158,7 @@ class Extractor:
             f"Categories: {json.dumps(cats, ensure_ascii=False)}"
         )
         try:
-            resp = await self.client.chat.completions.create(
+            resp = await self._create_completion(
                 model=self.cfg.llm_model,
                 temperature=0,
                 max_tokens=200,
@@ -113,7 +190,7 @@ class Extractor:
             f"TEXT (first 1500 chars):\n{text[:1500]}"
         )
         try:
-            resp = await self.client.chat.completions.create(
+            resp = await self._create_completion(
                 model=self.cfg.llm_model,
                 temperature=0,
                 max_tokens=5,
@@ -179,11 +256,16 @@ class Extractor:
       • włókno kokosowe — also written as: kokos, włókno z łupiny kokosowej, płyta kokosowa,
         mata kokosowa, warstwa kokosowa, coconut fibre, coconut fiber, coir
       • sizal / sisal — also written as: włókno sizalowe, sisal fiber
+      • coconut latex / lateks kokosowy / kokosowy lateks — a COMPOSITE material that bonds
+        coconut fiber with latex.  It QUALIFIES because it contains coconut fiber as a
+        structural component.  Do NOT confuse with pure natural latex (which does NOT qualify).
 
     NON-QUALIFYING materials — return "" even when the word "naturalny/naturalne" appears nearby:
-      • lateks / latex (naturalny lateks, latex Pulse, lateks Pulse, kauczuk, rubber,
-        mleko kauczukowe, naturalne mleko kauczukowe, mleczko kauczukowe — ALL of these
-        are natural rubber, NOT coconut fiber or sisal)
+      • pure lateks / pure latex WITHOUT coconut: naturalny lateks, latex Pulse, lateks Pulse,
+        kauczuk, rubber, mleko kauczukowe, naturalne mleko kauczukowe, mleczko kauczukowe,
+        natural latex — these are rubber tree derivatives, NOT coconut fiber or sisal.
+        EXCEPTION: "coconut latex / lateks kokosowy" DOES qualify (see above).
+      • wool / wełna (alpaca wool, merino wool, wełna alpaki, etc.) — does NOT qualify
       • pianka HR / pianka wysokoelastyczna / HR foam
       • pianka visco / memory foam / pianka termoelastyczna / viscoelastic
       • pianka Energy Foam, pianka hybrydowa
@@ -192,7 +274,8 @@ class Extractor:
 
   Decision rules:
     "yes" — the product's OWN composition/construction/specification section explicitly
-            mentions włókno kokosowe, kokos, sizal, or sisal as a material IN THIS product.
+            mentions włókno kokosowe, kokos, sizal, sisal, coconut latex, or lateks kokosowy
+            as a material IN THIS product.
     "no"  — the page contains a description, composition, construction, or specification
             of THIS product, and NONE of the qualifying materials (coconut fiber / sisal)
             appear in it.  This is the DEFAULT whenever the product is described but coconut
@@ -209,8 +292,11 @@ class Extractor:
   and coconut fiber / sisal is not among the materials, the answer is "no", not "".
 
   CRITICAL — common mistakes to avoid:
-    ✗ "naturalny lateks" → return "" (latex is rubber, not coconut fiber or sisal)
+    ✓ "coconut latex" → return "yes" (coconut fiber bonded with latex — QUALIFIES)
+    ✓ "lateks kokosowy" → return "yes" (Polish for coconut latex — QUALIFIES)
+    ✗ "naturalny lateks" → return "" (pure natural latex = rubber, does NOT qualify)
     ✗ "naturalne mleko kauczukowe" → return "" (rubber tree milk ≠ coconut fiber)
+    ✗ "alpaca wool / wełna alpaki" → return "no" (wool does NOT qualify)
     ✗ "niektóre modele zawierają kokos" → return "" (general statement, not this product)
     ✗ keyword appears in a different product's description → return ""
 
@@ -275,7 +361,7 @@ RELEVANT HTML SNIPPET (for image URLs):
 """
 
         try:
-            resp = await self.client.chat.completions.create(
+            resp = await self._create_completion(
                 model=self.cfg.llm_model,
                 temperature=self.cfg.llm_temperature,
                 max_tokens=self.cfg.llm_max_tokens,

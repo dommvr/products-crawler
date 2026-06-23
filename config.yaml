@@ -53,7 +53,12 @@ crawling:
   # How many product detail pages to load/extract at once during the fiber pass.
   # The fiber pass is the slowest phase; higher = faster (near-linear) but more load
   # on the site and OpenAI. 6 is a safe default; raise to ~10 if you have headroom.
-  fiber_pass_concurrency: 6
+  fiber_pass_concurrency: 3
+
+  # How many companies to crawl at the same time (each opens its own browser).
+  # Total concurrent work ≈ company_concurrency × fiber_pass_concurrency — mind your
+  # OpenAI rate limit and RAM. 3 is a safe default for a ~20-site batch.
+  company_concurrency: 2
 
   # Seconds to wait after the DOM loads, letting client-side JS render.
   # Lower = faster. 0.8s is enough for jysk/janpol; raise if a site renders late.
@@ -69,6 +74,13 @@ llm:
 
   # Temperature (0 = deterministic, higher = more creative — keep low for extraction)
   temperature: 0.1
+
+  # How many times to retry an OpenAI call when it returns HTTP 429 (rate limit) or a
+  # transient error, using exponential backoff that honors the server's Retry-After hint.
+  # This prevents silently dropping product extractions when you exceed your tokens/min
+  # (TPM) limit under concurrent crawling. 6 is a safe default; raise if you crawl many
+  # sites at high concurrency on a low TPM tier.
+  max_retries: 6
 
 # ── Output ────────────────────────────────────
 output:

@@ -62,6 +62,10 @@ class Config:
         # The fiber pass is the slowest phase; raising this speeds it up almost linearly.
         # 6 is a good balance of speed vs. politeness / OpenAI rate limits.
         self.fiber_concurrency: int = int(_deep_get(raw, "crawling", "fiber_pass_concurrency", default=6))
+        # How many companies to crawl at the same time (each uses its own browser).
+        # Total concurrent work ≈ company_concurrency × fiber_pass_concurrency, so keep
+        # an eye on OpenAI rate limits / RAM. 3 is a safe default for a 20-site batch.
+        self.company_concurrency: int = int(_deep_get(raw, "crawling", "company_concurrency", default=3))
         # Seconds to wait after a page's DOM loads, to let client-side JS render content.
         # Lower = faster but risks missing late-rendered text. 0.8s works for these sites.
         self.render_wait: float = float(_deep_get(raw, "crawling", "render_wait", default=0.8))
@@ -70,6 +74,9 @@ class Config:
         self.llm_model: str = _deep_get(raw, "llm", "model", default="gpt-4o-mini")
         self.llm_max_tokens: int = _deep_get(raw, "llm", "max_tokens", default=4000)
         self.llm_temperature: float = float(_deep_get(raw, "llm", "temperature", default=0.1))
+        # How many times to (re)try an OpenAI call on 429 rate-limit / transient errors,
+        # with exponential backoff. Higher = more resilient under TPM throttling, slower tail.
+        self.llm_max_retries: int = int(_deep_get(raw, "llm", "max_retries", default=6))
 
         # ── Output ─────────────────────────────────────────────────
         self.spreadsheet_name: str = _deep_get(raw, "output", "spreadsheet_name", default="products_data")

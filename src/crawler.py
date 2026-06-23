@@ -14,6 +14,7 @@ Key behaviours:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections import deque
@@ -53,24 +54,55 @@ HIGH_PRIORITY_PATTERNS = re.compile(
 LOW_PRIORITY_PATTERNS = re.compile(
     r"/(login|logowanie|konto|account|basket|koszyk|checkout|platnosc|payment"
     r"|customer|register|rejestracja|newsletter|gazetki|wyprzedaz(?!/.*materac)"
-    r"|znajdz-sklep|find-store|careers|kariera|b2b"
+    r"|znajdz-sklep|find-store|salon|do-domu|do-biura|careers|kariera|b2b"
     r"|customer-service|kontakt|contact|about|o-nas|regulamin|privacy"
     r"|faq|news|aktualnosci|press|media|sitemap|vr-|do-pobrania"
+    r"|impressum|datenschutz|haendlersuche|handlersuche|materialkunde"  # DE info pages
+    r"|gesund-schlafen|allergien|hygiene|widerruf|versandkosten"
     r"|wp-content|wp-admin|feed|rss|projekt-unijny"
     r"|lozka|lozko|lozek|ramy-lozek|stelaz|zaglowek|nogi-do-lozek|akcesoria-do-lozek"
     r"|lozka-goscinne|lozka-dzieciece|lozka-kontynentalne|lozka-pietrowe"
     r"|koldry|koldra|poduszki|poduszka|posciel|przescieradl|ochraniacze"
     r"|fotel|sofa|kanapa|sypialnia(?!/.*materac)"
+    r"|moebel|mobel|meble|furniture"          # furniture sections (DE/PL/EN) — not mattresses
+    r"|rekomendacj|realizacj|referencj"         # reference / showcase pages, not product lists
     r"|ogrod|garden|kemping|dmuchane"
     r"|wyrejestrowac|zmienic-moj-adres|porady|aktualnosci|inspiration|guide|blog)",
     re.IGNORECASE,
 )
 
-# URL path must contain one of these for a product to be relevant to the mattress fiber pass
+# URL path must contain one of these for a product to be relevant to the mattress fiber pass.
+# No leading "/" anchor: German shops use compounds like "naturmatratzen" / "kindermatratze"
+# where the mattress word is mid-slug, so we match the term anywhere in the path.
 MATTRESS_PATH_RE = re.compile(
-    r"/(materac|mattress|piank|sprezy|spręż|topper|topmat)",
+    r"(materac|matratze|mattress|piank|sprezy|spręż|topper|topmat)",
     re.IGNORECASE,
 )
+
+# Non-mattress accessory sections. Matched anywhere in the path (not just after a "/"),
+# because some sites embed them mid-slug, e.g. "/karta-produktowa-stelazy". These are
+# discarded BEFORE the high/low-priority test, so they win even though the slug also
+# contains "produkt". NOTE: "topper" here drops accessory toppers (e.g. optimum's
+# "karta-produktowa-topperow"); it does NOT match jysk's "topmaterace" mattress toppers.
+ACCESSORY_EXCLUDE_PATTERNS = re.compile(
+    r"(stelaz|stela[zż]|topper|nakladk|nakładk|nozki|nóżki|akcesori"
+    r"|pokrowiec|pokrowc|poduszk|koldr|kołdr|posciel|pościel"
+    r"|przescieradl|prześcieradł|ochraniacz|podkladk|podkładk"
+    r"|zaglowek|zagłówek|wezglowie|wezgłowie|ramy-lozek|rama-lozka)",
+    re.IGNORECASE,
+)
+
+# Path segments that mark a product-namespace (the product itself lives in a deeper
+# segment). Includes German "produkte". Used by _is_product_detail_url Method 2.
+_PRODUCT_NS_SEGMENTS = frozenset(
+    {"produkty", "products", "product", "produkt", "produkts", "produkte", "p"}
+)
+
+# Two-letter language path prefixes used by site language switchers.
+KNOWN_LANG_CODES = frozenset({
+    "en", "de", "fr", "ru", "uk", "cs", "sk", "it", "es", "nl", "pt", "sv",
+    "no", "da", "fi", "hu", "ro", "lt", "lv", "et", "bg", "hr", "sl", "el", "tr",
+})
 
 # Pagination link patterns
 PAGINATION_PATTERNS = re.compile(
@@ -101,16 +133,33 @@ VARIANT_SELECTORS = [
 
 # How many consecutive irrelevant pages before we stop crawling a site
 
+
+class _CompanyLogAdapter(logging.LoggerAdapter):
+    """Prefixes log lines with the company name, e.g. "[jysk]  [1/20] ...".
+
+    Keeps concurrent-company output traceable since their log lines interleave.
+    """
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['company']}] {msg}", kwargs
+
+
 class Crawler:
     def __init__(self, cfg: Config, extractor: Extractor) -> None:
         self.cfg = cfg
         self.extractor = extractor
 
     async def crawl_company(self, start_url: str, company_name: str) -> list[Product]:
-        log = logging.getLogger("crawler")
+        # Prefix every line with the company name so logs stay readable when several
+        # companies are crawled concurrently and their output interleaves.
+        log = _CompanyLogAdapter(logging.getLogger("crawler"), {"company": company_name})
         all_products: list[Product] = []
         visited: set[str] = set()
         base_domain = get_root_domain(start_url)
+        # Language of the start URL (None = site default / no /xx/ prefix). We stay within
+        # this language so a site's language switcher (/en/, /de/, …) doesn't make us crawl
+        # every product several times in different languages.
+        start_lang = _path_lang(start_url)
 
         # ── Priority queues ──────────────────────────────────────────
         # high_q: product/category URLs — processed first
@@ -174,16 +223,34 @@ class Crawler:
                     continue
 
                 # ── Collect and classify all links from this page ─────
-                new_links = _extract_links(html, url, base_domain, self.cfg.follow_subdomains)
-                for link in new_links:
+                # If THIS page is itself a mattress listing, its product-detail links are
+                # mattresses even when their own slug has no mattress keyword (e.g.
+                # grueneerde's /de-at/p/himmlische-wolke-premium/ge-p-50670).
+                source_is_mattress = bool(MATTRESS_PATH_RE.search(urlparse(url).path))
+                anchor_links, card_links = _extract_links(
+                    html, url, base_domain, self.cfg.follow_subdomains
+                )
+                for link in anchor_links:
                     lnorm = _strip_fragment(link)
                     if lnorm in visited or _is_download(link):
+                        continue
+                    lpath = urlparse(lnorm).path
+                    # Stay within the start URL's language — skip /en/, /de/, … duplicates.
+                    if _path_lang(lnorm) not in (None, start_lang):
+                        continue
+                    # Skip non-mattress accessory sections (toppers, bed frames/slats,
+                    # pillows, duvets, covers…) even when the URL also contains "produkt".
+                    # Checked BEFORE priority so these exclusions win over generic matches.
+                    if ACCESSORY_EXCLUDE_PATTERNS.search(lpath):
                         continue
                     # Product detail pages are NOT added to the main crawl queue.
                     # We record the first URL per base slug (only for mattress-relevant
                     # paths) and visit them all in the dedicated fiber detection pass.
-                    if _is_product_detail_url(link):
-                        if MATTRESS_PATH_RE.search(urlparse(lnorm).path):
+                    # Skip detail-looking URLs that are really info/utility pages nested
+                    # under a mattress-named folder (e.g. /produkte/<family>/kontakt) —
+                    # they'd waste a fiber call and yield no product.
+                    if _is_product_detail_url(link) and not _is_low_priority(link):
+                        if source_is_mattress or MATTRESS_PATH_RE.search(urlparse(lnorm).path):
                             base = _base_product_slug(lnorm)
                             if base not in pending_fiber_urls:
                                 pending_fiber_urls[base] = lnorm
@@ -194,6 +261,29 @@ class Crawler:
                     elif not _is_low_priority(link):
                         low_q.append(link)
                     # Low priority links are just discarded — saves pages for real content
+
+                # JS product-card links (data-* attributes) are clickable product cards,
+                # not <a href>. Treat each as a product detail page: skip categories /
+                # accessories / other-language / homepage, then queue for the fiber pass.
+                # No MATTRESS_PATH_RE gate here — the card sits on a mattress page, so the
+                # product is a mattress even if its slug is a bare name like "/rubin".
+                for link in card_links:
+                    lnorm = _strip_fragment(link)
+                    if lnorm in visited:
+                        continue
+                    lpath = urlparse(lnorm).path
+                    if not lpath.strip("/"):
+                        continue  # homepage / root card (e.g. logo)
+                    if _path_lang(lnorm) not in (None, start_lang):
+                        continue
+                    if ACCESSORY_EXCLUDE_PATTERNS.search(lpath):
+                        continue
+                    if _is_listing_url(lnorm) or _is_low_priority(lnorm):
+                        continue  # category / index / info card, not a single product
+                    base = _base_product_slug(lnorm)
+                    if base not in pending_fiber_urls:
+                        pending_fiber_urls[base] = lnorm
+                        log.debug(f"  Queued card-link for fiber pass: {lnorm}")
 
                 # ── Extract products (always — no pre-check LLM call) ─
                 # skip_fiber=True: category/listing pages are not reliable for fiber info.
@@ -288,19 +378,22 @@ class Crawler:
         #   3. higher fiber_confidence
         # Putting the detail-URL flag first guarantees a collapsed duplicate keeps the
         # specific product link, never the general /kategoria-produktu/ listing link.
-        def _dedup_key(p: Product) -> tuple:
-            is_detail = 1 if _is_product_detail_url(p.url) else 0
-            has_info = 1 if p.has_natural_fiber in ("yes", "no") else 0
-            return (is_detail, has_info, p.fiber_confidence)
-
         seen_names: dict[str, Product] = {}
+        dropped_junk = 0
         for p in all_products:
+            # Drop accessories / furniture / category-name / homepage-teaser pseudo-products
+            # that slipped in from mixed listing pages.
+            if _is_junk_product(p):
+                dropped_junk += 1
+                continue
             key = _normalize_product_name(p.product_name)
             if not key:
                 continue
-            if key not in seen_names or _dedup_key(p) > _dedup_key(seen_names[key]):
+            if key not in seen_names or _product_quality_key(p) > _product_quality_key(seen_names[key]):
                 seen_names[key] = p
         deduped = list(seen_names.values())
+        if dropped_junk:
+            log.info(f"  Dropped {dropped_junk} non-product row(s) (accessories/furniture/category names)")
 
         log.info(f"  Total unique products for {company_name}: {len(deduped)}")
         return deduped
@@ -429,6 +522,18 @@ def _is_download(url: str) -> bool:
     return bool(SKIP_EXTENSIONS.search(url.split("?")[0]))
 
 
+def _path_lang(url: str) -> str | None:
+    """Return the language code if the path starts with a /xx/ language prefix, else None.
+
+    e.g. https://optimum-materace.pl/en/products → "en"
+         https://optimum-materace.pl/kategorie-materacow → None  (site default)
+    """
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    if segments and segments[0].lower() in KNOWN_LANG_CODES:
+        return segments[0].lower()
+    return None
+
+
 def _is_high_priority(url: str) -> bool:
     """True if URL looks like a product or category page."""
     path = urlparse(url).path
@@ -443,12 +548,23 @@ def _is_low_priority(url: str) -> bool:
     return bool(LOW_PRIORITY_PATTERNS.search(path))
 
 
+def _is_listing_url(url: str) -> bool:
+    """True if URL is a category / listing / index page rather than a single product."""
+    return bool(_LISTING_URL_RE.search(urlparse(url).path))
+
+
 def _is_product_detail_url(url: str) -> bool:
     """True if URL looks like an individual product page rather than a category listing.
 
-    Two detection methods:
-    1. /produkty/slug or /products/slug path pattern (janpol-style short slugs)
-    2. Long last segment (>20 chars, ≥2 dashes) — jysk-style e.g.
+    Three detection methods:
+    1. Singular "materac-<name>" slug — a SINGLE product (optimum-style short slugs like
+       /materac-diament, /materac-rehabilitacyjny-syriusz). Works even for single-segment
+       paths. The plural "materace-…" (a category, e.g. /materace-piankowe) is NOT matched
+       because it has no dash right after "materac".
+    2. A product-namespace segment (produkt / produkty / products / produkte …) appears
+       ANYWHERE before the last segment. Covers both janpol-style "/produkty/<slug>" and
+       hilding-style "/produkt/<category>/<slug>" (namespace at -3), plus German "/produkte/".
+    3. Long last segment (>20 chars, ≥2 dashes) — jysk-style e.g.
        /materace-piankowe/materac-piankowy-80x200cm-hulda-twardy
        /topmaterace/topmaterac-80x200cm-marren  (only 2 dashes!)
 
@@ -458,13 +574,21 @@ def _is_product_detail_url(url: str) -> bool:
         return False
     path = urlparse(url).path.rstrip("/")
     segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False
+    last = segments[-1]
+    # Method 1: singular "materac-<name>" / "mattress-<name>" product slug
+    low = last.lower()
+    if low.startswith("materac-") or low.startswith("mattress-"):
+        return True
     if len(segments) < 2:
         return False
-    # Method 1: explicit product-namespace segment
-    if segments[-2].lower() in ("produkty", "products", "product", "produkt", "produkts"):
+    # Method 2: a product-namespace segment somewhere before the last segment.
+    # "/produkt/<cat>/<slug>" (hilding) and "/produkte/<family>/<variant>" (lonsberg, DE)
+    # both put the namespace at -3, not just -2, so scan all but the final segment.
+    if any(seg.lower() in _PRODUCT_NS_SEGMENTS for seg in segments[:-1]):
         return True
-    # Method 2: long, dash-rich slug
-    last = segments[-1]
+    # Method 3: long, dash-rich slug
     return len(last) > 20 and last.count("-") >= 2
 
 
@@ -573,6 +697,79 @@ def _normalize_product_name(name: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip().lower()
 
 
+# Product NAMES that denote a non-mattress item (accessory / furniture). The LLM sometimes
+# extracts these from listing pages that mix mattresses with related products. We drop them
+# by name because they often have no detail page and would otherwise survive as junk rows.
+# NOTE: "topper" matches German "Matratzentopper" but NOT jysk's wanted "Topmaterac"
+# (which contains "topm", not "topp").
+_NONPRODUCT_NAME_RE = re.compile(
+    r"(nakladk|nakładk|ochraniacz|pokrowiec|pokrowc|poszewk|podkladk|podkładk"
+    r"|stelaz|stela[zż]|n[oó]zki|n[oó]żki|zaglowek|zagłówek|wezglow|wezgłow"
+    r"|matratzentopper|topper|unterbett|bettsofa|bettgestell|polsterbett|otoman|kielich"
+    r"|kopfkissen|nackenkissen|\bkissen\b|decke\b|lattenrost|auflage|schlafmaske"
+    r"|\bbett\b|\blozko\b|\blóżko\b|\błóżko\b|\bsofa\b|\bbaza\b)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Product NAMES that are really a category / family heading, not a single product.
+# Plural "Materace …" / German "…matratzen" standing alone are category tiles the LLM
+# misread as products (e.g. "Materace kokosowe", "Naturmatratzen").
+_CATEGORY_NAME_RE = re.compile(
+    r"^\s*(materace\b|natur.?matratzen\b|matratzen\b)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _is_junk_product(p: Product) -> bool:
+    """True if an extracted 'product' is actually an accessory, furniture item, a bare
+    category/family name, or a homepage teaser (URL has no path) — i.e. not a real mattress."""
+    name = p.product_name or ""
+    if _NONPRODUCT_NAME_RE.search(name):
+        return True
+    if _CATEGORY_NAME_RE.search(name):
+        return True
+    # Homepage / root URL teaser — a real product or listing always has a path segment.
+    if not urlparse(p.url).path.strip("/"):
+        return True
+    # Extracted from a utility/landing/blog page (e.g. jysk /do-domu, /salon, /inspiration)
+    # — those teaser tiles ("Materac KOKOS", "FLYA") are not real products.
+    if _is_low_priority(p.url):
+        return True
+    return False
+
+
+def _product_quality_key(p: Product) -> tuple:
+    """Ranking for choosing which duplicate record to keep (higher wins):
+      1. came from a direct product DETAIL URL  (kept row links to /produkt…, not /kategoria)
+      2. has an actual fiber verdict "yes"/"no"  (beats undetermined "")
+      3. higher fiber_confidence
+    Putting the detail-URL flag first guarantees a collapsed duplicate keeps the specific
+    product link, never the general category listing link."""
+    is_detail = 1 if _is_product_detail_url(p.url) else 0
+    has_info = 1 if p.has_natural_fiber in ("yes", "no") else 0
+    return (is_detail, has_info, p.fiber_confidence)
+
+
+def dedup_across_companies(products: list[Product]) -> list[Product]:
+    """Collapse duplicates that appear across multiple crawl passes of the SAME company.
+
+    When names.txt lists two sub-sections of one site (e.g. two lonsberg category URLs),
+    each pass crawls the whole domain and rediscovers all products, so the same product is
+    emitted by both passes. Per-company dedup inside crawl_company can't see across passes;
+    this global pass does. Keyed by (company, normalized name) so different companies that
+    happen to share a model name (e.g. jysk vs optimum "HULDA") are NOT merged. The kept
+    record is the highest quality one per _product_quality_key."""
+    best: dict[tuple, Product] = {}
+    for p in products:
+        name_key = _normalize_product_name(p.product_name)
+        if not name_key:
+            continue
+        key = (p.company_name, name_key)
+        if key not in best or _product_quality_key(p) > _product_quality_key(best[key]):
+            best[key] = p
+    return list(best.values())
+
+
 # Generic words that are NOT distinctive product identifiers — ignored when matching
 # a product name against a URL slug (they appear in almost every slug).
 _GENERIC_NAME_TOKENS = frozenset({
@@ -609,23 +806,67 @@ def _pick_primary_product(products: list[Product], detail_url: str) -> Product:
     return products[0]
 
 
+# Page-builder data attributes that carry a navigation URL on a non-anchor element.
+# Some sites (Elementor / HappyAddons, etc.) make whole product cards clickable via JS
+# instead of a plain <a href>, so BeautifulSoup's anchor scan misses the product links.
+_DATA_LINK_PLAIN_ATTRS = ("data-href", "data-url", "data-link", "data-permalink", "data-clickurl")
+
+# URLs that are category / listing / index pages rather than a single product.
+# Used to filter JS card links so only genuine product pages enter the fiber pass.
+# Note: plural "materace-…" / "materace" is a CATEGORY (e.g. /materace-hybrydowe); the
+# singular "materac-…" is a product and is intentionally NOT matched here.
+_LISTING_URL_RE = re.compile(
+    r"(kategori|kolekcj|category|collection|karta-produktowa|produkty-"
+    r"|/produkty$|/produkty/|materace(?:[-/]|$)|mattresses(?:[-/]|$))",
+    re.IGNORECASE,
+)
+
+
 def _extract_links(
     html: str, base_url: str, base_domain: str, follow_subdomains: bool
-) -> list[str]:
-    """Extract all href links from HTML, returning same-site URLs only."""
+) -> tuple[list[str], list[str]]:
+    """Extract same-site links from HTML.
+
+    Returns (anchor_links, card_links):
+      • anchor_links — normal <a href> links (categories, nav, pagination, products…).
+      • card_links   — product-card navigations stored in data-* attributes (JS-clickable
+                       cards that aren't <a href>). These are treated as product detail
+                       pages by the caller.
+    """
     soup = BeautifulSoup(html, "lxml")
-    links: list[str] = []
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
+    anchors: list[str] = []
+    cards: list[str] = []
+
+    def _add(container: list[str], href: str | None) -> None:
+        if not href:
+            return
+        href = href.strip()
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
-            continue
-        full_url = urljoin(base_url, href)
-        full_url = _strip_fragment(full_url)
+            return
+        full_url = _strip_fragment(urljoin(base_url, href))
         if not full_url.startswith(("http://", "https://")):
-            continue
+            return
         if same_site(full_url, base_domain, follow_subdomains):
-            links.append(full_url)
-    return links
+            container.append(full_url)
+
+    # Plain anchor links
+    for tag in soup.find_all("a", href=True):
+        _add(anchors, tag.get("href"))
+
+    # JS card links: HappyAddons stores a JSON blob {"url": "..."} in data-ha-element-link
+    for tag in soup.find_all(attrs={"data-ha-element-link": True}):
+        raw = tag.get("data-ha-element-link")
+        try:
+            _add(cards, json.loads(raw).get("url", ""))
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    # JS card links: plain URL stored directly in a data-* attribute
+    for attr in _DATA_LINK_PLAIN_ATTRS:
+        for tag in soup.find_all(attrs={attr: True}):
+            _add(cards, tag.get(attr))
+
+    return anchors, cards
 
 
 def _strip_fragment(url: str) -> str:

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from src.config import Config
-from src.crawler import Crawler
+from src.crawler import Crawler, dedup_across_companies
 from src.extractor import Extractor
 from src.resolver import resolve
 from src.sheets import SheetsWriter
@@ -47,35 +47,57 @@ async def run(cfg: Config) -> None:
     all_products = []
     failed = []
 
-    for i, entry in enumerate(names, 1):
-        entry = entry.strip()
-        if not entry:
-            continue
+    # Crawl several companies at once (each gets its own browser). A semaphore caps
+    # how many run simultaneously so we don't overwhelm OpenAI rate limits / RAM.
+    entries = [(i, e.strip()) for i, e in enumerate(names, 1) if e.strip()]
+    concurrency = max(1, cfg.company_concurrency)
+    company_sem = asyncio.Semaphore(concurrency)
+    log.info(f"Crawling up to {concurrency} compan{'y' if concurrency == 1 else 'ies'} concurrently")
 
+    async def process_company(i: int, entry: str) -> tuple[list, str | None]:
         # Use entry as company name (strip protocol/www for display)
-        company_display = entry.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
-        log.info(f"\n[{i}/{len(names)}] Processing: {entry!r} → company: {company_display!r}")
+        company_display = (
+            entry.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
+        )
+        async with company_sem:
+            log.info(f"[{i}/{len(entries)}] Processing: {entry!r} → company: {company_display!r}")
 
-        # ── Step 1: Resolve to a working URL ──────────────────────────
-        url = await resolve(entry, cfg)
-        if not url:
-            log.error(f"  Could not find a working URL for {entry!r} — skipping")
-            failed.append(entry)
-            continue
+            # ── Step 1: Resolve to a working URL ──────────────────────────
+            try:
+                url = await resolve(entry, cfg)
+            except Exception as e:
+                log.error(f"  [{company_display}] URL resolution failed: {e}")
+                return [], entry
+            if not url:
+                log.error(f"  [{company_display}] Could not find a working URL — skipping")
+                return [], entry
 
-        # ── Step 2: Crawl the site ─────────────────────────────────────
-        log.info(f"  Starting crawl from: {url}")
-        t0 = time.time()
-        try:
-            products = await crawler.crawl_company(url, company_display)
-        except Exception as e:
-            log.error(f"  Crawl failed for {entry!r}: {e}")
-            failed.append(entry)
-            continue
+            # ── Step 2: Crawl the site ─────────────────────────────────────
+            log.info(f"  [{company_display}] Starting crawl from: {url}")
+            t0 = time.time()
+            try:
+                products = await crawler.crawl_company(url, company_display)
+            except Exception as e:
+                log.error(f"  [{company_display}] Crawl failed: {e}")
+                return [], entry
 
-        elapsed = time.time() - t0
-        log.info(f"  Crawl done in {elapsed:.1f}s — {len(products)} product(s) found")
+            elapsed = time.time() - t0
+            log.info(f"  [{company_display}] Crawl done in {elapsed:.1f}s — {len(products)} product(s) found")
+            return products, None
+
+    results = await asyncio.gather(*(process_company(i, e) for i, e in entries))
+    for products, failed_entry in results:
         all_products.extend(products)
+        if failed_entry:
+            failed.append(failed_entry)
+
+    # Global dedup: when names.txt lists several sub-sections of the SAME site, each pass
+    # crawls the whole domain and rediscovers the same products. Collapse those cross-pass
+    # duplicates (per company + product name) so each product appears once in the output.
+    before = len(all_products)
+    all_products = dedup_across_companies(all_products)
+    if before != len(all_products):
+        log.info(f"Global dedup: {before} → {len(all_products)} rows (collapsed cross-entry duplicates)")
 
     # ── Step 3: Write to Google Sheets ────────────────────────────────
     if all_products:
